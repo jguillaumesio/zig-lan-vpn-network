@@ -1,145 +1,81 @@
 # hamachi-like
 
-A tiny peer-to-peer overlay VPN in [Zig](https://ziglang.org), in the spirit of
-LogMeIn Hamachi / ZeroTier. Peers get a virtual LAN address and talk to each
-other directly over UDP, punching through NATs with the help of a lightweight
-coordination server. Traffic is carried on a real OS TUN interface, so any
-IP application (SSH, ping, game servers, …) works unmodified.
+A small VPN-like tool that puts your machines on the same virtual LAN, no matter
+where they are. Like LogMeIn Hamachi or ZeroTier: each machine gets a private
+address (e.g. `10.66.0.2`), and you can `ssh`, `ping`, share files, or play LAN
+games between them as if they were plugged into the same switch.
 
-This is **v1: a working command-line client + server** for macOS, Linux and
-Windows.
+**Right now it's command-line only.** A GUI is the next big step (see below).
 
-```
-        ┌──────────────┐   register / peer list (UDP)   ┌──────────────┐
-        │   peer A      │ ─────────────┐   ┌───────────► │   peer B     │
-        │ tun 10.66.0.2 │              ▼   │             │ tun 10.66.0.3│
-        └───────┬───────┘        ┌─────────────┐         └──────┬───────┘
-                │                │ coordination │                │
-                │                │   server     │                │
-                │                └─────────────┘                 │
-                └───────── direct UDP tunnel (hole-punched) ──────┘
-                          (data never flows through the server)
-```
+## What it does, step by step
 
-## How it works
+1. **A TUN interface.** On each machine we create a virtual network card (a
+   "TUN" device). Anything the OS sends to `10.66.0.x` gets handed to our program
+   instead of a real cable.
 
-1. **Coordination server** — a process on a public IP. Peers register with it
-   over UDP using a shared secret. It hands each peer a stable virtual address
-   (default subnet `10.66.0.0/24`), remembers the public endpoint it saw each
-   peer arrive from (the NAT-reflexive address), and periodically pushes every
-   peer the roster of all other peers.
+2. **A coordination server.** You run one small server somewhere with a public IP.
+   Machines check in with it (using a shared secret), and it hands each one a
+   virtual address and tells everyone who else is on the network. It only does
+   introductions — your actual traffic never goes through it.
 
-2. **Peers** open a TUN device, register, and receive their virtual address plus
-   the peer roster. For every peer they fire UDP "punch" probes at the other's
-   public endpoint; because both sides do this on the *same socket they used to
-   reach the server*, the NAT mappings line up and a direct path opens.
+3. **UDP hole punching.** Two machines behind home routers normally can't reach
+   each other directly. Using the endpoints the server saw, both sides fire UDP
+   packets at each other at the same time, which tricks their routers into
+   leaving a path open. After that, the two machines talk **directly**.
 
-3. **Data** — once a direct path exists, IP packets read off the TUN device are
-   wrapped in a 5-byte header and sent straight to the destination peer's
-   endpoint. Nothing but control traffic touches the server.
+4. **Forwarding.** Once the path is open, packets read off the TUN device are
+   wrapped in UDP and sent straight to the right machine. The other side unwraps
+   them and writes them back to its TUN device. That's the whole VPN.
 
-A single UDP socket per peer carries both control and data traffic — this is
-what makes hole punching work.
+## Why Zig 0.14
 
-## Requirements
+This is written in Zig, pinned to **version 0.14.0**.
 
-- **Zig 0.14.0** exactly. The 0.15/0.16 standard library reorganised the socket
-  and I/O layers incompatibly; this project targets the stable 0.14.0 API.
-  Download it from <https://ziglang.org/download/#release-0.14.0>.
-- **Root / Administrator** on peers (creating a TUN interface is privileged).
-- **Windows only:** the [Wintun](https://www.wintun.net) driver. Drop
-  `wintun.dll` (matching your CPU architecture) next to the executable. Windows
-  has no built-in layer-3 tunnel.
+Zig is still evolving fast, and the newer 0.15/0.16 releases (including the one
+Homebrew installs today) ripped out and rewrote the standard-library socket and
+low-level OS layers that this project depends on — they're mid-migration and not
+stable yet. 0.14.0 is the last release with the settled `std.posix`
+socket/ioctl API we build on, so everything here targets it.
 
-## Build
+Get it from <https://ziglang.org/download/#release-0.14.0>.
+
+## Build & run
 
 ```sh
-zig build                      # native build -> zig-out/bin/hamachi-like
-zig build -Doptimize=ReleaseSafe
+zig build -Doptimize=ReleaseSafe          # -> zig-out/bin/hamachi-like
+zig build test                            # run the tests
 ```
 
-Cross-compile for another platform:
-
-```sh
-zig build -Dtarget=x86_64-linux-gnu   -Doptimize=ReleaseSafe
-zig build -Dtarget=aarch64-linux-gnu  -Doptimize=ReleaseSafe
-zig build -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe
-zig build -Dtarget=aarch64-macos      -Doptimize=ReleaseSafe
-```
-
-Run the tests:
-
-```sh
-zig build test
-```
-
-## Usage
-
-On a machine with a public IP (no root needed — it never touches a TUN device):
+On a machine with a public IP (no root needed):
 
 ```sh
 hamachi-like server --secret s3cret
-# --listen 0.0.0.0:7777   (default)
-# --subnet 10.66.0.0/24   (default)
 ```
 
-On each peer (needs root/Administrator):
+On each machine that should join (needs root/Administrator to create the TUN):
 
 ```sh
 sudo hamachi-like join --server vpn.example.com:7777 --secret s3cret
-# --name default          network label
-# --ip 10.66.0.10         request a specific overlay address
-# --dev ham0              TUN interface name hint
 ```
 
-Once two peers are up you can use their overlay addresses directly:
+Then just use the virtual addresses: `ping 10.66.0.3`, `ssh user@10.66.0.3`, etc.
 
-```sh
-ping 10.66.0.3
-ssh user@10.66.0.3
-```
+Windows note: install the [Wintun](https://www.wintun.net) driver and drop
+`wintun.dll` next to the executable — Windows has no built-in TUN device.
 
-## Security status (read this)
+## Status & limitations
 
-**v1 does not encrypt data traffic.** The shared secret only authenticates
-registration with the coordination server (via a SHA-256 digest); it is not used
-to encrypt or authenticate peer-to-peer packets. Do not treat this as a secure
-VPN yet. Adding an authenticated-encryption layer (e.g. Noise / X25519 +
-ChaCha20-Poly1305 per peer) is the top item on the roadmap.
+- CLI only for now.
+- **Not encrypted yet** — the secret only gates joining the server; peer traffic
+  is currently plaintext. Encryption is planned.
+- No relay fallback, so two peers behind very strict (symmetric) NATs may fail to
+  connect directly.
+- IPv4 only.
 
-## Known limitations (v1)
+## The goal from here
 
-- **No encryption** (see above).
-- **No relay fallback.** If both peers are behind *symmetric* NATs, direct hole
-  punching can fail and those two peers won't connect. A TURN-style relay through
-  the server is planned.
-- **IPv4 only** on the overlay and for the carrier.
-- **No persistent identity.** Addresses are assigned per session (though you can
-  request one with `--ip`).
-
-## Project layout
-
-| File | Responsibility |
-|------|----------------|
-| `src/main.zig` | CLI parsing and command dispatch |
-| `src/protocol.zig` | Wire format: encode/decode of all message types |
-| `src/server.zig` | Coordination server: auth, address assignment, roster broadcast |
-| `src/client.zig` | Peer: registration, hole punching, TUN⇆UDP forwarding |
-| `src/udp.zig` | Small UDP socket helpers |
-| `src/tun.zig` | Cross-platform TUN abstraction + IP configuration |
-| `src/tun_linux.zig` | `/dev/net/tun` backend |
-| `src/tun_macos.zig` | `utun` (PF_SYSTEM control socket) backend |
-| `src/tun_windows.zig` | Wintun backend (dynamically loads `wintun.dll`) |
-| `src/integration_test.zig` | End-to-end coordinator handshake test over loopback |
-
-## Verification status
-
-Built and link-checked for `aarch64-macos`, `x86_64-linux-gnu`,
-`aarch64-linux-gnu`, `x86_64-linux-musl` and `x86_64-windows-gnu`. Unit tests and
-an end-to-end coordinator handshake test (auth, address assignment, peer-list
-broadcast) pass. The TUN data plane requires root and has been exercised via the
-real CLI binaries up to the point of device creation; end-to-end packet
-forwarding should be validated on two real hosts.
+Finish it by adding a **GUI** — a simple app to start/stop the network, see who's
+online, and copy addresses — so it's usable without touching a terminal.
 
 ## License
 
