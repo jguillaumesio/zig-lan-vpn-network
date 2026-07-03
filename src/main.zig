@@ -1,8 +1,8 @@
 //! hamachi-like: a tiny peer-to-peer overlay VPN.
 //!
 //! Two roles:
-//!   server  — a public-IP coordinator that peers rendezvous through.
-//!   join    — a peer that opens a TUN device and hole-punches to other peers.
+//!   server  - a public-IP coordinator that peers rendezvous through.
+//!   join    - a peer that opens a TUN device and hole-punches to other peers.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -14,16 +14,19 @@ const Client = @import("client.zig").Client;
 const default_port = 7777;
 
 const usage =
-    \\hamachi-like — peer-to-peer overlay network (TUN + UDP hole punching)
+    \\hamachi-like - peer-to-peer overlay network (TUN + UDP hole punching)
     \\
     \\USAGE:
     \\  hamachi-like server [options]
     \\  hamachi-like join   [options]
     \\
-    \\SERVER OPTIONS (run this on a machine with a public IP):
+    \\SERVER OPTIONS (host the network AND join it; needs a reachable address
+    \\                and root/Administrator - the server takes the first
+    \\                overlay address, e.g. 10.66.0.1):
     \\  --listen <ip:port>    Address to listen on         (default 0.0.0.0:7777)
     \\  --secret <key>        Shared network secret         (required)
     \\  --subnet <cidr>       Overlay subnet                (default 10.66.0.0/24)
+    \\  --dev <name>          TUN interface name hint       (default per-OS)
     \\
     \\JOIN OPTIONS (run this on each peer; needs root/Administrator):
     \\  --server <host:port>  Coordinator address           (required)
@@ -33,8 +36,8 @@ const usage =
     \\  --dev <name>          TUN interface name hint       (default per-OS)
     \\
     \\EXAMPLES:
-    \\  # On the public host:
-    \\  hamachi-like server --secret s3cret
+    \\  # On the host (reachable address; hosts the network and joins it):
+    \\  sudo hamachi-like server --secret s3cret
     \\
     \\  # On each peer:
     \\  sudo hamachi-like join --server vpn.example.com:7777 --secret s3cret
@@ -83,6 +86,7 @@ fn runServer(gpa: std.mem.Allocator, args: []const []const u8) !void {
     var listen_str: []const u8 = "0.0.0.0:7777";
     var secret: ?[]const u8 = null;
     var subnet_str: []const u8 = "10.66.0.0/24";
+    var dev: []const u8 = defaultDevName();
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -93,6 +97,8 @@ fn runServer(gpa: std.mem.Allocator, args: []const []const u8) !void {
             secret = try nextArg(args, &i, "--secret");
         } else if (std.mem.eql(u8, a, "--subnet")) {
             subnet_str = try nextArg(args, &i, "--subnet");
+        } else if (std.mem.eql(u8, a, "--dev")) {
+            dev = try nextArg(args, &i, "--dev");
         } else {
             std.log.err("unknown server option: {s}", .{a});
             return error.BadArgs;
@@ -112,6 +118,7 @@ fn runServer(gpa: std.mem.Allocator, args: []const []const u8) !void {
         .secret = sec,
         .subnet = cidr.base,
         .prefix = cidr.prefix,
+        .device_name = dev,
     });
     defer srv.deinit();
 

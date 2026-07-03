@@ -47,10 +47,11 @@ test "coordinator handshake: auth, assignment, broadcast" {
         .subnet = .{ 10, 66, 0, 0 },
         .prefix = 24,
     });
-    // Server.run loops forever on a detached thread; the process tears it down.
+    // Run only the control plane (no TUN, so no root needed). It loops forever
+    // on a detached thread; the process tears it down.
     const port = try udp.localPort(srv.sock);
     const server_addr = try std.net.Address.parseIp4("127.0.0.1", port);
-    (try std.Thread.spawn(.{}, Server.run, .{&srv})).detach();
+    (try std.Thread.spawn(.{}, Server.runControlPlane, .{&srv})).detach();
 
     const good = proto.authDigest("test-secret");
 

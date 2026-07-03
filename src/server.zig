@@ -1,20 +1,31 @@
-//! Coordination / rendezvous server.
+//! Coordination server - and a full member of the overlay itself.
 //!
-//! Peers all speak to this one public-IP process over UDP. It:
+//! Running the server puts you *inside* the network: this process is both the
+//! rendezvous point that introduces peers to each other AND an ordinary member
+//! with its own overlay address (the first host address, e.g. 10.66.0.1) and
+//! TUN device.
+//!
+//! As the rendezvous it:
 //!   * authenticates registrations against a shared secret,
 //!   * hands each peer a stable virtual (overlay) IP,
-//!   * records the public endpoint it observed each peer arrive from
-//!     (the NAT-reflexive address), and
-//!   * periodically pushes every peer the roster of all other peers so they
-//!     can hole-punch direct tunnels to each other.
+//!   * records the public endpoint it observed each peer arrive from, and
+//!   * periodically pushes every peer the roster of all members.
 //!
-//! The server never carries data traffic — only control. Once peers learn each
-//! other's endpoints they talk directly.
+//! As a member it also carries its own data traffic: packets other members send
+//! to its address are written to its TUN, and packets its OS emits toward the
+//! overlay are forwarded straight to the right peer. It never relays traffic
+//! *between* other peers - those talk directly after being introduced.
+//!
+//! The server doesn't need to know its own public IP: every member already
+//! reaches it at the address they were configured with, so it advertises itself
+//! in the roster with a zero "sentinel" endpoint that each member resolves to
+//! the server address it is already using.
 
 const std = @import("std");
 const posix = std.posix;
 const proto = @import("protocol.zig");
 const udp = @import("udp.zig");
+const tun = @import("tun.zig");
 
 const peer_timeout_ms: i64 = 30_000;
 const broadcast_interval_ms: i64 = 5_000;
@@ -37,6 +48,8 @@ pub const Config = struct {
     /// Overlay subnet base address, e.g. 10.66.0.0.
     subnet: proto.VAddr,
     prefix: u8,
+    /// TUN interface name hint for the server's own membership.
+    device_name: []const u8 = "ham0",
 };
 
 pub const Server = struct {
@@ -45,18 +58,31 @@ pub const Server = struct {
     auth: [proto.auth_len]u8,
     subnet: u32,
     prefix: u8,
+    /// The server's own overlay address (subnet + 1), reserved from assignment.
+    self_vaddr: proto.VAddr,
+    self_u32: u32,
+    device_name: []const u8,
+
+    dev_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    dev: ?*tun.Device = null,
+
     mutex: std.Thread.Mutex = .{},
-    /// keyed by virtual address as u32
+    /// keyed by virtual address as u32 - holds *other* members (not self)
     peers: std.AutoHashMap(u32, Peer),
 
     pub fn init(gpa: std.mem.Allocator, cfg: Config) !Server {
         const sock = try udp.bind(cfg.listen);
+        const subnet = proto.vaddrToU32(cfg.subnet);
+        const self_u32 = subnet + 1;
         return .{
             .gpa = gpa,
             .sock = sock,
             .auth = proto.authDigest(cfg.secret),
-            .subnet = proto.vaddrToU32(cfg.subnet),
+            .subnet = subnet,
             .prefix = cfg.prefix,
+            .self_vaddr = proto.u32ToVaddr(self_u32),
+            .self_u32 = self_u32,
+            .device_name = cfg.device_name,
             .peers = std.AutoHashMap(u32, Peer).init(gpa),
         };
     }
@@ -66,10 +92,30 @@ pub const Server = struct {
         posix.close(self.sock);
     }
 
+    /// Run as a full member: bring up our own TUN, then serve forever.
     pub fn run(self: *Server) !void {
-        const maint = try std.Thread.spawn(.{}, maintenanceLoop, .{self});
-        maint.detach();
+        var device = try tun.Device.open(self.gpa, self.device_name);
+        defer device.deinit();
+        std.log.info("opened tunnel interface {s}", .{device.name()});
+        try tun.configure(self.gpa, device.name(), self.self_vaddr, self.prefix);
+        self.dev = &device;
+        self.dev_ready.store(true, .release);
+        std.log.info("joined overlay as {d}.{d}.{d}.{d}/{d}", .{
+            self.self_vaddr[0], self.self_vaddr[1], self.self_vaddr[2], self.self_vaddr[3], self.prefix,
+        });
 
+        (try std.Thread.spawn(.{}, tunRxLoop, .{ self, &device })).detach();
+        (try std.Thread.spawn(.{}, maintenanceLoop, .{self})).detach();
+        self.serve();
+    }
+
+    /// Serve only the control plane (no TUN). Used by tests.
+    pub fn runControlPlane(self: *Server) void {
+        (std.Thread.spawn(.{}, maintenanceLoop, .{self}) catch return).detach();
+        self.serve();
+    }
+
+    fn serve(self: *Server) void {
         var buf: [2048]u8 = undefined;
         while (true) {
             const r = udp.recvFrom(self.sock, &buf) catch |e| {
@@ -86,7 +132,9 @@ pub const Server = struct {
         switch (t) {
             .register => self.handleRegister(datagram[1..], from_ep),
             .ping => self.handlePing(datagram[1..], from_ep),
-            else => {}, // servers ignore peer-to-peer message types
+            .data => self.handleData(datagram[1..]),
+            .punch => self.handlePunch(datagram[1..], from),
+            else => {},
         }
     }
 
@@ -162,6 +210,42 @@ pub const Server = struct {
         _ = udp.sendToEndpoint(self.sock, pong, from) catch {};
     }
 
+    /// A member sent us overlay data; write the inner IP packet to our TUN.
+    fn handleData(self: *Server, payload: []const u8) void {
+        if (payload.len < 4) return;
+        const ip_packet = payload[4..];
+        if (self.dev_ready.load(.acquire)) {
+            if (self.dev) |d| _ = d.write(ip_packet) catch {};
+        }
+    }
+
+    /// Answer punches so members see the host as a reachable, connected peer.
+    fn handlePunch(self: *Server, payload: []const u8, from: std.net.Address) void {
+        const p = proto.decodePunch(payload) catch return;
+        var out: [16]u8 = undefined;
+        const ack = proto.encodePunch(&out, .punch_ack, self.self_vaddr, p.nonce);
+        _ = udp.sendTo(self.sock, ack, from) catch {};
+    }
+
+    /// Read IP packets off our TUN and forward each to the destination member.
+    fn tunRxLoop(self: *Server, device: *tun.Device) void {
+        var buf: [proto.data_header_len + tun.max_packet]u8 = undefined;
+        while (true) {
+            const n = device.read(buf[proto.data_header_len..]) catch continue;
+            const pkt = buf[proto.data_header_len .. proto.data_header_len + n];
+            const dst = ipv4Dest(pkt) orelse continue;
+
+            self.mutex.lock();
+            const peer = self.peers.get(proto.vaddrToU32(dst));
+            self.mutex.unlock();
+
+            if (peer) |pr| {
+                _ = proto.encodeDataHeader(&buf, self.self_vaddr);
+                _ = udp.sendToEndpoint(self.sock, buf[0 .. proto.data_header_len + n], pr.endpoint) catch {};
+            }
+        }
+    }
+
     /// Caller must hold the mutex.
     fn assignAddress(self: *Server, requested: proto.VAddr, from: proto.Endpoint) !proto.VAddr {
         // Reconnection: if this exact endpoint is already known, reuse its addr.
@@ -173,15 +257,15 @@ pub const Server = struct {
         const host_bits: u5 = @intCast(32 - self.prefix);
         const count: u32 = if (host_bits >= 32) 0xffffffff else (@as(u32, 1) << host_bits);
 
-        // Honor a valid, free requested address.
+        // Honor a valid, free requested address (but never our own reserved one).
         const req = proto.vaddrToU32(requested);
-        if (req != 0 and (req & masked(self.prefix)) == self.subnet) {
+        if (req != 0 and req != self.self_u32 and (req & masked(self.prefix)) == self.subnet) {
             if (!self.peers.contains(req)) return requested;
         }
 
-        // Otherwise take the first free host address (skip .0 network and the
-        // all-ones broadcast address).
-        var host: u32 = 1;
+        // Otherwise take the first free host address. Skip .0 (network), the
+        // all-ones broadcast, and .1 (reserved for the server itself).
+        var host: u32 = 2;
         while (host < count - 1) : (host += 1) {
             const cand = self.subnet + host;
             if (!self.peers.contains(cand)) return proto.u32ToVaddr(cand);
@@ -199,7 +283,6 @@ pub const Server = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var entries: [proto.max_peers_per_list]proto.PeerEntry = undefined;
         var all: [proto.max_peers_per_list]Peer = undefined;
         var n: usize = 0;
         var it = self.peers.iterator();
@@ -209,12 +292,22 @@ pub const Server = struct {
             n += 1;
         }
 
+        // Sentinel endpoint (0.0.0.0:0) => "the server address you already use".
+        const self_entry = proto.PeerEntry{
+            .vaddr = self.self_vaddr,
+            .endpoint = .{ .ip = .{ 0, 0, 0, 0 }, .port = 0 },
+        };
+
+        var entries: [proto.max_peers_per_list]proto.PeerEntry = undefined;
         var buf: [2048]u8 = undefined;
         for (all[0..n]) |target| {
-            // Build a roster excluding the target itself.
             var m: usize = 0;
+            // Every member always learns about the host.
+            entries[m] = self_entry;
+            m += 1;
             for (all[0..n]) |p| {
                 if (proto.vaddrToU32(p.vaddr) == proto.vaddrToU32(target.vaddr)) continue;
+                if (m >= entries.len) break;
                 entries[m] = .{ .vaddr = p.vaddr, .endpoint = p.endpoint };
                 m += 1;
             }
@@ -254,6 +347,12 @@ pub const Server = struct {
 
 fn masked(prefix: u8) u32 {
     return if (prefix == 0) 0 else @as(u32, 0xffffffff) << @intCast(32 - prefix);
+}
+
+fn ipv4Dest(pkt: []const u8) ?proto.VAddr {
+    if (pkt.len < 20) return null;
+    if (pkt[0] >> 4 != 4) return null;
+    return pkt[16..20].*;
 }
 
 test "masked prefix" {

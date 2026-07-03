@@ -2,14 +2,14 @@
 //!
 //! One UDP socket carries everything: control traffic to the coordination
 //! server and data/hole-punch traffic to peers. Using a single socket is what
-//! makes UDP hole punching work — the NAT mapping the server sees is the same
+//! makes UDP hole punching work - the NAT mapping the server sees is the same
 //! one peers send to.
 //!
 //! Three threads cooperate:
-//!   * rx      — blocking recvfrom loop; dispatches every inbound datagram.
-//!   * tun_rx  — reads IP packets off the TUN device and forwards them to the
+//!   * rx      - blocking recvfrom loop; dispatches every inbound datagram.
+//!   * tun_rx  - reads IP packets off the TUN device and forwards them to the
 //!               right peer.
-//!   * maint   — periodic keepalive to the server and hole-punch/keepalive
+//!   * maint   - periodic keepalive to the server and hole-punch/keepalive
 //!               probes to every known peer.
 
 const std = @import("std");
@@ -175,15 +175,21 @@ pub const Client = struct {
         defer self.mutex.unlock();
         for (entries) |e| {
             if (proto.vaddrToU32(e.vaddr) == proto.vaddrToU32(self.vaddr)) continue;
+            // A zero sentinel endpoint means "the server itself" - reach it at
+            // the address we already use for the server.
+            const endpoint = if (isSentinel(e.endpoint))
+                proto.Endpoint.fromAddress(self.server)
+            else
+                e.endpoint;
             const gop = self.peers.getOrPut(proto.vaddrToU32(e.vaddr)) catch continue;
             if (!gop.found_existing) {
-                gop.value_ptr.* = .{ .vaddr = e.vaddr, .endpoint = e.endpoint };
+                gop.value_ptr.* = .{ .vaddr = e.vaddr, .endpoint = endpoint };
                 std.log.info("discovered peer {d}.{d}.{d}.{d} at {f}", .{
-                    e.vaddr[0], e.vaddr[1], e.vaddr[2], e.vaddr[3], e.endpoint,
+                    e.vaddr[0], e.vaddr[1], e.vaddr[2], e.vaddr[3], endpoint,
                 });
             } else if (gop.value_ptr.state != .connected) {
-                // Not yet talking directly — trust the server's latest view.
-                gop.value_ptr.endpoint = e.endpoint;
+                // Not yet talking directly - trust the server's latest view.
+                gop.value_ptr.endpoint = endpoint;
             }
         }
     }
@@ -278,6 +284,10 @@ fn setRecvTimeout(sock: posix.socket_t, ms: u32) !void {
         .usec = @intCast((ms % 1000) * 1000),
     };
     try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(tv));
+}
+
+fn isSentinel(ep: proto.Endpoint) bool {
+    return ep.port == 0 and std.mem.allEqual(u8, &ep.ip, 0);
 }
 
 /// Extract the destination address of an IPv4 packet, or null if it isn't one.
